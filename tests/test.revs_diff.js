@@ -1,17 +1,23 @@
-var adapters = ['idb-1', 'http-1']
-  , qunit = module;
+/*globals initTestDB: false, emit: true, generateAdapterUrl: false */
+/*globals PERSIST_DATABASES: false */
+/*globals cleanupTestDatabases: false */
+
+"use strict";
+
+var adapters = ['http-1', 'local-1'];
+var qunit = module;
+var LevelPouch;
 
 // if we are running under node.js, set things up
 // a little differently, and only test the leveldb adapter
 if (typeof module !== undefined && module.exports) {
-  var Pouch = require('../src/pouch.js')
-    , LevelPouch = require('../src/adapters/pouch.leveldb.js')
-    , utils = require('./test.utils.js')
+  var Pouch = require('../src/pouch.js');
+  var LevelPouch = require('../src/adapters/pouch.leveldb.js');
+  var utils = require('./test.utils.js');
 
   for (var k in utils) {
     global[k] = global[k] || utils[k];
   }
-  adapters = ['ldb-1', 'http-1']
   qunit = QUnit.module;
 }
 
@@ -20,7 +26,9 @@ adapters.map(function(adapter) {
   qunit("revs diff:" + adapter, {
     setup : function () {
       this.name = generateAdapterUrl(adapter);
-    }
+      Pouch.enableAllDbs = true;
+    },
+    teardown: cleanupTestDatabases
   });
 
   asyncTest("Test revs diff", function() {

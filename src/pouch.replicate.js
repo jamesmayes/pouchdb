@@ -1,117 +1,262 @@
+/*globals call: false, Crypto: false*/
+
+'use strict';
+
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = Pouch;
 }
 
-(function() {
+// We create a basic promise so the caller can cancel the replication possibly
+// before we have actually started listening to changes etc
+var Promise = function() {
+  this.cancelled = false;
+  this.cancel = function() {
+    this.cancelled = true;
+  };
+};
 
-  function replicate(src, target, opts, callback, replicateRet) {
+// The RequestManager ensures that only one database request is active at
+// at time, it ensures we dont max out simultaneous HTTP requests and makes
+// the replication process easier to reason about
+var RequestManager = function() {
 
-    fetchCheckpoint(src, target, function(checkpoint) {
-      var results = [];
-      var completed = false;
-      var pending = 0;
-      var last_seq = checkpoint;
-      var continuous = opts.continuous || false;
-      var result = {
-        ok: true,
-        start_time: new Date(),
-        docs_read: 0,
-        docs_written: 0
-      };
+  var queue = [];
+  var api = {};
+  var processing = false;
 
-      function isCompleted() {
-        if (completed && pending === 0) {
-          result.end_time = new Date();
-          writeCheckpoint(src, target, last_seq, function() {
-            call(callback, null, result);
-          });
-        }
-      }
-
-      if (replicateRet.cancelled) {
-        return;
-      }
-
-      var repOpts = {
-        continuous: continuous,
-        since: checkpoint,
-        onChange: function(change) {
-          last_seq = change.seq;
-          results.push(change);
-          result.docs_read++;
-          pending++;
-          var diff = {};
-          diff[change.id] = change.changes.map(function(x) { return x.rev; });
-          target.revsDiff(diff, function(err, diffs) {
-            if (Object.keys(diffs).length === 0) {
-              pending--;
-              isCompleted();
-              return;
-            }
-            for (var id in diffs) {
-              diffs[id].missing.map(function(rev) {
-                src.get(id, {revs: true, rev: rev, attachments: true}, function(err, doc) {
-                  target.bulkDocs({docs: [doc]}, {new_edits: false}, function() {
-                    if (opts.onChange) {
-                      opts.onChange.apply(this, [result]);
-                    }
-                    result.docs_written++;
-                    pending--;
-                    isCompleted();
-                  });
-                });
-              });
-            }
-          });
-        },
-        complete: function(err, res) {
-          completed = true;
-          isCompleted();
-        }
-      };
-
-      if (opts.filter) {
-        repOpts.filter = opts.filter;
-      }
-
-      var changes = src.changes(repOpts);
-      if (opts.continuous) {
-        replicateRet.cancel = changes.cancel;
-      }
-    });
-  }
-
-  function toPouch(db, callback) {
-    if (typeof db === 'string') {
-      return new Pouch(db, callback);
+  // Add a new request to the queue, if we arent currently processing anything
+  // then process it immediately
+  api.enqueue = function(fun, args) {
+    queue.push({fun: fun, args: args});
+    if (!processing) {
+      api.process();
     }
-    callback(null, db);
-  }
-
-  Pouch.replicate = function(src, target, opts, callback) {
-    // TODO: This needs some cleaning up, from the replicate call I want
-    // to return a promise in which I can cancel continuous replications
-    // this will just proxy requests to cancel the changes feed but only
-    // after we start actually running the changes feed
-    var ret = function() {
-      this.cancelled = false;
-      this.cancel = function() {
-        this.cancelled = true;
-      }
-    }
-    var replicateRet = new ret();
-    toPouch(src, function(err, src) {
-      if (err) {
-        return callback(err);
-      }
-      toPouch(target, function(err, target) {
-        if (err) {
-          return callback(err);
-        }
-        replicate(src, target, opts, callback, replicateRet);
-      });
-    });
-    return replicateRet;
   };
 
-}).call(this);
+  // Process the next request
+  api.process = function() {
+    if (processing || !queue.length) {
+      return;
+    }
+    processing = true;
+    var task = queue.shift();
+    task.fun.apply(null, task.args);
+  };
+
+  // We need to be notified whenever a request is complete to process
+  // the next request
+  api.notifyRequestComplete = function() {
+    processing = false;
+    api.process();
+  };
+
+  return api;
+};
+
+// TODO: check CouchDB's replication id generation, generate a unique id particular
+// to this replication
+var genReplicationId = function(src, target, opts) {
+  var filterFun = opts.filter ? opts.filter.toString() : '';
+  return '_local/' + Crypto.MD5(src.id() + target.id() + filterFun);
+};
+
+// A checkpoint lets us restart replications from when they were last cancelled
+var fetchCheckpoint = function(target, id, callback) {
+  target.get(id, function(err, doc) {
+    if (err && err.status === 404) {
+      callback(null, 0);
+    } else {
+      callback(null, doc.last_seq);
+    }
+  });
+};
+
+var writeCheckpoint = function(target, id, checkpoint, callback) {
+  var check = {
+    _id: id,
+    last_seq: checkpoint
+  };
+  target.get(check._id, function(err, doc) {
+    if (doc && doc._rev) {
+      check._rev = doc._rev;
+    }
+    target.put(check, function(err, doc) {
+      callback();
+    });
+  });
+};
+
+function replicate(src, target, opts, promise) {
+
+  var requests = new RequestManager();
+  var writeQueue = [];
+  var repId = genReplicationId(src, target, opts);
+  var results = [];
+  var completed = false;
+  var pending = 0;
+  var last_seq = 0;
+  var continuous = opts.continuous || false;
+  var doc_ids = opts.doc_ids;
+  var result = {
+    ok: true,
+    start_time: new Date(),
+    docs_read: 0,
+    docs_written: 0
+  };
+
+  function docsWritten(err, res, len) {
+    requests.notifyRequestComplete();
+    if (opts.onChange) {
+      for (var i = 0; i < len; i++) {
+        /*jshint validthis:true */
+        opts.onChange.apply(this, [result]);
+      }
+    }
+    pending -= len;
+    result.docs_written += len;
+    isCompleted();
+  }
+
+  function writeDocs() {
+    if (!writeQueue.length) {
+      return requests.notifyRequestComplete();
+    }
+    var len = writeQueue.length;
+    target.bulkDocs({docs: writeQueue}, {new_edits: false}, function(err, res) {
+      docsWritten(err, res, len);
+    });
+    writeQueue = [];
+  }
+
+  function eachRev(id, rev) {
+    src.get(id, {revs: true, rev: rev, attachments: true}, function(err, doc) {
+      requests.notifyRequestComplete();
+      writeQueue.push(doc);
+      requests.enqueue(writeDocs);
+    });
+  }
+
+  function onRevsDiff(err, diffs) {
+    requests.notifyRequestComplete();
+    if (err) {
+      if (continuous) {
+        promise.cancel();
+      }
+      call(opts.complete, err, null);
+      return;
+    }
+
+    // We already have the full document stored
+    if (Object.keys(diffs).length === 0) {
+      pending--;
+      isCompleted();
+      return;
+    }
+
+    var _enqueuer = function (rev) {
+        requests.enqueue(eachRev, [id, rev]);
+    };
+
+    for (var id in diffs) {
+      diffs[id].missing.forEach(_enqueuer);
+    }
+  }
+
+  function fetchRevsDiff(diff) {
+    target.revsDiff(diff, onRevsDiff);
+  }
+
+  function onChange(change) {
+    last_seq = change.seq;
+    results.push(change);
+    result.docs_read++;
+    pending++;
+    var diff = {};
+    diff[change.id] = change.changes.map(function(x) { return x.rev; });
+    requests.enqueue(fetchRevsDiff, [diff]);
+  }
+
+  function complete() {
+    completed = true;
+    isCompleted();
+  }
+
+  function isCompleted() {
+    if (completed && pending === 0) {
+      result.end_time = Date.now();
+      writeCheckpoint(target, repId, last_seq, function(err, res) {
+        call(opts.complete, err, result);
+      });
+    }
+  }
+
+  fetchCheckpoint(target, repId, function(err, checkpoint) {
+
+    if (err) {
+      return call(opts.complete, err);
+    }
+
+    last_seq = checkpoint;
+
+    // Was the replication cancelled by the caller before it had a chance
+    // to start. Shouldnt we be calling complete?
+    if (promise.cancelled) {
+      return;
+    }
+
+    var repOpts = {
+      continuous: continuous,
+      since: last_seq,
+      style: 'all_docs',
+      onChange: onChange,
+      complete: complete,
+      doc_ids: doc_ids
+    };
+
+    if (opts.filter) {
+      repOpts.filter = opts.filter;
+    }
+
+    if (opts.query_params) {
+      repOpts.query_params = opts.query_params;
+    }
+
+    var changes = src.changes(repOpts);
+
+    if (opts.continuous) {
+      promise.cancel = changes.cancel;
+    }
+  });
+
+}
+
+function toPouch(db, callback) {
+  if (typeof db === 'string') {
+    return new Pouch(db, callback);
+  }
+  callback(null, db);
+}
+
+Pouch.replicate = function(src, target, opts, callback) {
+  if (opts instanceof Function) {
+    callback = opts;
+    opts = {};
+  }
+  if (opts === undefined) {
+    opts = {};
+  }
+  opts.complete = callback;
+  var replicateRet = new Promise();
+  toPouch(src, function(err, src) {
+    if (err) {
+      return call(callback, err);
+    }
+    toPouch(target, function(err, target) {
+      if (err) {
+        return call(callback, err);
+      }
+      replicate(src, target, opts, replicateRet);
+    });
+  });
+  return replicateRet;
+};

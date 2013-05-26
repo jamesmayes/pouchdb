@@ -1,10 +1,12 @@
+/*globals $:false, console: false */
+
 "use strict";
 
 // use query parameter testFiles if present,
 // eg: test.html?testFiles=test.basics.js
 var testFiles = window.location.search.match(/[?&]testFiles=([^&]+)/);
 testFiles = testFiles && testFiles[1].split(',') || [];
-
+var started = new Date();
 if (!testFiles.length) {
   // If you want to run performance tests, uncomment these tests
   // and comment out the testFiles below
@@ -14,30 +16,57 @@ if (!testFiles.length) {
 
   // Temporarily disable auth replication
   // 'test.auth_replication.js',
-  testFiles = ['test.basics.js', 'test.changes.js',
+  testFiles = ['test.basics.js', 'test.all_dbs.js', 'test.changes.js',
                'test.bulk_docs.js', 'test.all_docs.js', 'test.conflicts.js',
                'test.merge_rev_tree.js',  'test.revs_diff.js',
-               'test.replication.js', 'test.views.js',
-               'test.design_docs.js'];
-
-  // attachments dont run well on the ci server yet.
-  // if there is a hash, it is because the git rev is put on the url as a hash
-  // take that as a sign not to run the attachment tests
-  if (!window.location.hash || window.location.hash.length === 0) {
-    testFiles.push('test.attachments.js');
-  }
+               'test.replication.js', 'test.views.js', 'test.taskqueue.js',
+               'test.design_docs.js', 'test.issue221.js', 'test.http.js',
+               'test.gql.js', 'test.compaction.js', 'test.get.js',
+               'test.attachments.js'];
 }
 
 testFiles.unshift('test.utils.js');
 
 var sourceFiles = {
-  'dev': ['../src/deps/uuid.js',
-          '../src/pouch.js', '../src/pouch.merge.js', '../src/pouch.replicate.js',
+  'dev': ['../src/deps/uuid.js', '../src/deps/extend.js', '../src/deps/ajax.js',
+          '../src/pouch.js', '../src/pouch.adapter.js', '../src/pouch.merge.js',
+          '../src/pouch.replicate.js',
           '../src/pouch.collate.js', '../src/pouch.utils.js',
-          '../src/adapters/pouch.http.js', '../src/adapters/pouch.idb.js'],
-  'release': ['../pouch.alpha.js'],
-  'release-min': ['../pouch.alpha.min.js']
+          '../src/adapters/pouch.http.js', '../src/adapters/pouch.idb.js',
+          '../src/adapters/pouch.websql.js',
+          '../src/plugins/pouchdb.gql.js',
+          '../src/plugins/pouchdb.mapreduce.js',
+          '../src/plugins/pouchdb.spatial.js'],
+  'release': ['../dist/pouchdb-nightly.js', '../src/deps/extend.js', '../src/deps/ajax.js'],
+  'release-min': ['../dist/pouchdb-nightly.min.js', '../src/deps/extend.js', '../src/deps/ajax.js']
 };
+
+// Logic to automatically scoll qunit tests. Required for saucelabs output, to exactly see whta is happening
+(function() {
+  var scroll = window.location.search.match(/[?&]scroll=true/);
+  if (!scroll) {
+    return;
+  }
+
+  function findPos(obj) {
+    var curtop = 0;
+    if (obj.offsetParent) {
+      do {
+        curtop += obj.offsetTop;
+      } while ((obj = obj.offsetParent));
+      return [curtop];
+    }
+  }
+
+  window.setInterval(function() {
+    try {
+      var running = document.getElementsByClassName('running')[0];
+      window.scroll(0, findPos(running) - 100);
+    } catch (e) {
+      // dont do anything here
+    }
+  }, 2000);
+}());
 
 // Thanks to http://engineeredweb.com/blog/simple-async-javascript-loader/
 function asyncLoadScript(url, callback) {
@@ -70,9 +99,7 @@ function asyncLoadScript(url, callback) {
 }
 
 function startQUnit() {
-  QUnit.begin = function() {
-    console.log('running!!!');
-  };
+  QUnit.config.reorder = false;
 }
 
 function asyncParForEach(array, fn, callback) {
@@ -89,7 +116,7 @@ function asyncParForEach(array, fn, callback) {
 var source = window.location.search.match(/[?&]test=([^&]+)/);
 source = source && source[1] || 'dev';
 
-QUnit.config.testTimeout = 30000;
+QUnit.config.testTimeout = 60000;
 
 /**** Test Result Support ***************/
 function submitResults() {
@@ -121,25 +148,12 @@ function submitResults() {
   });
 }
 
-var doc = {};
-
+document.getElementById('submit-results').addEventListener('click', submitResults);
 QUnit.jUnitReport = function(report) {
-  doc.report = report;
-  doc.completed = new Date().getTime();
-  document.getElementById('submit-results').addEventListener('click', submitResults);
-  new Pouch(generateAdapterUrl('http-110'), function(err, db) {
-    if (err) {
-      return console.log('Cant open db to store results');
-    }
-    db.post(doc, function (err, info) {
-      if (err) {
-        return console.log('Could not post results');
-      }
-      document.body.setAttribute('data-results-id', info.id);
-      document.body.classList.add('complete');
-      $('body').append('<p>Storing Results Complete.</p>');
-    });
-  });
+  report.started = started;
+  report.completed = new Date();
+  report.passed = (report.results.failed === 0);
+  window.testReport = report;
 };
 
 asyncParForEach(sourceFiles[source], asyncLoadScript, function() {

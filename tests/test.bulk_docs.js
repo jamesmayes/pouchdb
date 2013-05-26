@@ -1,18 +1,25 @@
+/*globals initTestDB: false, emit: true, generateAdapterUrl: false */
+/*globals PERSIST_DATABASES: false, initDBPair: false, utils: true */
+/*globals ajax: true, LevelPouch: true, makeDocs: false */
+/*globals cleanupTestDatabases: false */
+
+"use strict";
+
 // Porting tests from Apache CouchDB bulk docs tests
 // https://github.com/apache/couchdb/blob/master/share/www/script/test/bulk_docs.js
 
-var adapters = ['idb-1', 'http-1']
-  , qunit = module;
+var adapters = ['local-1', 'http-1'];
+var qunit = module;
+var LevelPouch;
 
 if (typeof module !== undefined && module.exports) {
-  var Pouch = require('../src/pouch.js')
-    , LevelPouch = require('../src/adapters/pouch.leveldb.js')
-    , utils = require('./test.utils.js')
+  Pouch = require('../src/pouch.js');
+  LevelPouch = require('../src/adapters/pouch.leveldb.js');
+  utils = require('./test.utils.js');
 
   for (var k in utils) {
     global[k] = global[k] || utils[k];
   }
-  adapters = ['ldb-1', 'http-1']
   qunit = QUnit.module;
 }
 
@@ -21,7 +28,9 @@ adapters.map(function(adapter) {
   qunit('bulk_docs: ' + adapter, {
     setup : function () {
       this.name = generateAdapterUrl(adapter);
-    }
+      Pouch.enableAllDbs = true;
+    },
+    teardown: cleanupTestDatabases
   });
 
   var authors = [
@@ -46,7 +55,7 @@ adapters.map(function(adapter) {
         db.bulkDocs({docs: docs}, function(err, results) {
           ok(results.length === 5, 'results length matches');
           for (i = 0; i < 5; i++) {
-            ok(results[i].id == i.toString(), 'id matches again');
+            ok(results[i].id === i.toString(), 'id matches again');
             // set the delete flag to delete the docs in the next step
             docs[i]._rev = results[i].rev;
             docs[i]._deleted = true;
@@ -56,7 +65,7 @@ adapters.map(function(adapter) {
               ok(results[0].error === 'conflict', 'First doc should be in conflict');
               ok(typeof results[0].rev === "undefined", 'no rev in conflict');
               for (i = 1; i < 5; i++) {
-                ok(results[i].id == i.toString());
+                ok(results[i].id === i.toString());
                 ok(results[i].rev);
               }
               start();
@@ -80,6 +89,46 @@ adapters.map(function(adapter) {
           ok(results[0].error === 'conflict' || results[1].error === 'conflict');
           start();
         });
+      });
+    });
+  });
+
+  asyncTest('No _rev and new_edits=false', function() {
+    initTestDB(this.name, function(err, db) {
+      var docs = [
+        {_id: "foo", integer: 1}
+      ];
+      db.bulkDocs({docs: docs}, {new_edits: false}, function(err, res) {
+        ok(err, "error reported");
+        start();
+      });
+    });
+  });
+
+  asyncTest("Test errors on invalid doc id", function() {
+    var docs = [
+      {'_id': '_invalid', foo: 'bar'}
+    ];
+    initTestDB(this.name, function(err, db) {
+      db.bulkDocs({docs: docs}, function(err, info) {
+        equal(err.error, 'bad_request', 'correct error returned');
+        ok(!info, 'info is empty');
+        start();
+      });
+    });
+  });
+
+  asyncTest("Test two errors on invalid doc id", function() {
+    var docs = [
+      {'_id': '_invalid', foo: 'bar'},
+      {'_id': 123, foo: 'bar'}
+    ];
+    initTestDB(this.name, function(err, db) {
+      db.bulkDocs({docs: docs}, function(err, info) {
+        equal(err.error, 'bad_request', 'correct error returned');
+        equal(err.reason, Pouch.Errors.RESERVED_ID.reason, 'correct error message returned');
+        ok(!info, 'info is empty');
+        start();
       });
     });
   });
@@ -126,4 +175,35 @@ adapters.map(function(adapter) {
     });
   });
 
+  asyncTest('Bulk with new_edits=false', function() {
+    initTestDB(this.name, function(err, db) {
+      var docs = [
+        {"_id":"foo","_rev":"2-x","_revisions":
+          {"start":2,"ids":["x","a"]}
+        },
+        {"_id":"foo","_rev":"2-y","_revisions":
+          {"start":2,"ids":["y","a"]}
+        }
+      ];
+      db.bulkDocs({docs: docs}, {new_edits: false}, function(err, res){
+        //ok(res.length === 0, "empty array returned");
+        db.get("foo", {open_revs: "all"}, function(err, res){
+          ok(res[0].ok._rev === "2-x", "doc1 ok");
+          ok(res[1].ok._rev === "2-y", "doc2 ok");
+          start();
+        });
+      });
+    });
+  });
+
+  asyncTest('656 regression in handling deleted docs', function() {
+    initTestDB(this.name, function(err, db) {
+      db.bulkDocs({docs: [{_id: "foo", _rev: "1-a", _deleted: true}]}, {new_edits: false}, function(err, res){
+        db.get("foo", function(err, res){
+          ok(err, "deleted");
+          start();
+        });
+      });
+    });
+  });
 });

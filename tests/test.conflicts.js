@@ -1,17 +1,24 @@
-var adapters = ['idb-1', 'http-1']
-  , qunit = module;
+/*globals initTestDB: false, emit: true, generateAdapterUrl: false */
+/*globals PERSIST_DATABASES: false, initDBPair: false, utils: true */
+/*globals ajax: true, LevelPouch: true */
+/*globals cleanupTestDatabases: false */
+
+"use strict";
+
+var adapters = ['http-1', 'local-1'];
+var qunit = module;
+var LevelPouch;
 
 // if we are running under node.js, set things up
 // a little differently, and only test the leveldb adapter
 if (typeof module !== undefined && module.exports) {
-  var Pouch = require('../src/pouch.js')
-    , LevelPouch = require('../src/adapters/pouch.leveldb.js')
-    , utils = require('./test.utils.js')
+  Pouch = require('../src/pouch.js');
+  LevelPouch = require('../src/adapters/pouch.leveldb.js');
+  utils = require('./test.utils.js');
 
   for (var k in utils) {
     global[k] = global[k] || utils[k];
   }
-  adapters = ['ldb-1', 'http-1']
   qunit = QUnit.module;
 }
 
@@ -20,7 +27,9 @@ adapters.map(function(adapter) {
   qunit('conflicts: ' + adapter, {
     setup : function () {
       this.name = generateAdapterUrl(adapter);
-    }
+      Pouch.enableAllDbs = true;
+    },
+    teardown: cleanupTestDatabases
   });
 
   asyncTest('Testing conflicts', function() {
@@ -37,13 +46,15 @@ adapters.map(function(adapter) {
             ok(res.ok, 'Put second doc');
             db.put(doc2, function(err) {
               ok(err.error === 'conflict', 'Put got a conflicts');
-              db.changes(function(err, results) {
-                ok(results.results.length === 1, 'We have one entry in changes');
-                doc2._rev = undefined;
-                db.put(doc2, function(err) {
-                  ok(err.error === 'conflict', 'Another conflict');
-                  start();
-                });
+              db.changes({
+                complete: function(err, results) {
+                  ok(results.results.length === 1, 'We have one entry in changes');
+                  doc2._rev = undefined;
+                  db.put(doc2, function(err) {
+                    ok(err.error === 'conflict', 'Another conflict');
+                    start();
+                  });
+                }
               });
             });
           });
@@ -54,12 +65,7 @@ adapters.map(function(adapter) {
 
   asyncTest('Testing conflicts', function() {
     var doc = {_id: 'fubar', a:1, b: 1};
-    Pouch(this.name, function(err, db) {
-      if (err) {
-        console.error(err);
-        ok(false, 'failed to open database');
-        return start();
-      }
+    initTestDB(this.name, function(err, db) {
       db.put(doc, function(err, ndoc) {
         doc._rev = ndoc.rev;
         db.remove(doc, function() {

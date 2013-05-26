@@ -1,17 +1,24 @@
-var adapters = ['idb-1', 'http-1']
-  , qunit = module;
+/*globals initTestDB: false, emit: true, generateAdapterUrl: false */
+/*globals PERSIST_DATABASES: false, initDBPair: false, utils: true */
+/*globals ajax: true, LevelPouch: true */
+/*globals cleanupTestDatabases: false */
+
+"use strict";
+
+var adapters = ['local-1', 'http-1'];
+var qunit = module;
+var LevelPouch;
 
 // if we are running under node.js, set things up
 // a little differently, and only test the leveldb adapter
 if (typeof module !== undefined && module.exports) {
-  var Pouch = require('../src/pouch.js')
-    , LevelPouch = require('../src/adapters/pouch.leveldb.js')
-    , utils = require('./test.utils.js')
+  Pouch = require('../src/pouch.js');
+  LevelPouch = require('../src/adapters/pouch.leveldb.js');
+  utils = require('./test.utils.js');
 
   for (var k in utils) {
     global[k] = global[k] || utils[k];
   }
-  adapters = ['ldb-1', 'http-1']
   qunit = QUnit.module;
 }
 
@@ -20,7 +27,9 @@ adapters.map(function(adapter) {
   qunit("design_docs: " + adapter, {
     setup : function () {
       this.name = generateAdapterUrl(adapter);
-    }
+      Pouch.enableAllDbs = true;
+    },
+    teardown: cleanupTestDatabases
   });
 
   var doc = {
@@ -114,11 +123,15 @@ adapters.map(function(adapter) {
         var cnt = 0;
         db.query('foo/scores', {reduce: false}, function(err, result) {
           equal(result.rows.length, 1, 'Correct # of results');
-          if (cnt++ === 1) start();
+          if (cnt++ === 1) {
+            start();
+          }
         });
         db.query('foo/scores', {reduce: false}, function(err, result) {
           equal(result.rows.length, 1, 'Correct # of results');
-          if (cnt++ === 1) start();
+          if (cnt++ === 1) {
+            start();
+          }
         });
       });
     });

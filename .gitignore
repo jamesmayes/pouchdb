@@ -1,4 +1,10 @@
-/pouch*.js
-.DS_Store
-.idea
+dist
+.*
+!.gitignore
 sauce_connect.log*
+node_modules
+test_suite_db
+testdb_*
+_allDbs/
+docs/_site
+npm-debug.log

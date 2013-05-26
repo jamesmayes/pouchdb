@@ -1,3 +1,8 @@
+/*jshint strict: false */
+/*global request: true, Buffer: true, escape: true, $:true */
+/*global extend: true, Crypto: true */
+/*global chrome*/
+
 // Pretty dumb name for a function, just wraps callback calls so we dont
 // to if (callback) callback() everywhere
 var call = function(fun) {
@@ -5,7 +10,7 @@ var call = function(fun) {
   if (typeof fun === typeof Function) {
     fun.apply(this, args);
   }
-}
+};
 
 // Wrapper for functions that call the bulkdocs api with a single doc,
 // if the first result is an error, return an error
@@ -19,25 +24,36 @@ var yankError = function(callback) {
   };
 };
 
+var isLocalId = function(id) {
+  return (/^_local/).test(id);
+};
+
 var isAttachmentId = function(id) {
-  return (/\//.test(id)
-      && !/^_local/.test(id)
-      && !/^_design/.test(id));
-}
+  return (/\//.test(id) && !isLocalId(id) && !/^_design/.test(id));
+};
 
 // Parse document ids: docid[/attachid]
 //   - /attachid is optional, and can have slashes in it too
 //   - int ids and strings beginning with _design or _local are not split
 // returns an object: { docId: docid, attachmentId: attachid }
 var parseDocId = function(id) {
-  var ids = (typeof id === 'string') && !(/^_(design|local)\//.test(id))
-    ? id.split('/')
-    : [id]
+  var ids = (typeof id === 'string') && !(/^_(design|local)\//.test(id)) ?
+    id.split('/') : [id];
   return {
     docId: ids[0],
     attachmentId: ids.splice(1).join('/').replace(/^\/+/, '')
+  };
+};
+
+// Determine id an ID is valid
+//   - invalid IDs begin with an underescore that does not begin '_design' or '_local'
+//   - any other string value is a valid id
+var isValidId = function(id) {
+  if (/^_/.test(id)) {
+    return (/^_(design|local)/).test(id);
   }
-}
+  return true;
+};
 
 // Preprocess documents, parse their revisions, assign an id and a
 // revision for new writes that are missing them, etc
@@ -49,39 +65,44 @@ var parseDoc = function(doc, newEdits) {
     var id = parseDocId(doc._id);
     if (id.attachmentId !== '') {
       var attachment = btoa(JSON.stringify(doc));
-      doc = {
-        _id: id.docId,
-      }
+      doc = {_id: id.docId};
       if (!doc._attachments) {
         doc._attachments = {};
       }
       doc._attachments[id.attachmentId] = {
         content_type: 'application/json',
         data: attachment
-      }
+      };
     }
+  }
+
+  var nRevNum;
+  var newRevId;
+  var revInfo;
+  var opts = {status: 'available'};
+  if (doc._deleted) {
+    opts.deleted = true;
   }
 
   if (newEdits) {
     if (!doc._id) {
       doc._id = Math.uuid();
     }
-    var newRevId = Math.uuid(32, 16).toLowerCase();
-    var nRevNum;
+    newRevId = Math.uuid(32, 16).toLowerCase();
     if (doc._rev) {
-      var revInfo = /^(\d+)-(.+)$/.exec(doc._rev);
+      revInfo = /^(\d+)-(.+)$/.exec(doc._rev);
       if (!revInfo) {
         throw "invalid value for property '_rev'";
       }
       doc._rev_tree = [{
         pos: parseInt(revInfo[1], 10),
-        ids: [revInfo[2], [[newRevId, []]]]
+        ids: [revInfo[2], {status: 'missing'}, [[newRevId, opts, []]]]
       }];
       nRevNum = parseInt(revInfo[1], 10) + 1;
     } else {
       doc._rev_tree = [{
         pos: 1,
-        ids : [newRevId, []]
+        ids : [newRevId, opts, []]
       }];
       nRevNum = 1;
     }
@@ -91,22 +112,25 @@ var parseDoc = function(doc, newEdits) {
         pos: doc._revisions.start - doc._revisions.ids.length + 1,
         ids: doc._revisions.ids.reduce(function(acc, x) {
           if (acc === null) {
-            return [x, []];
+            return [x, opts, []];
           } else {
-            return [x, [acc]];
+            return [x, {status: 'missing'}, [acc]];
           }
         }, null)
       }];
       nRevNum = doc._revisions.start;
-      newRevId = doc._revisions.ids[doc._revisions.ids.length-1];
+      newRevId = doc._revisions.ids[0];
     }
     if (!doc._rev_tree) {
-      var revInfo = /^(\d+)-(.+)$/.exec(doc._rev);
+      revInfo = /^(\d+)-(.+)$/.exec(doc._rev);
+      if (!revInfo) {
+        return Pouch.Errors.BAD_ARG;
+      }
       nRevNum = parseInt(revInfo[1], 10);
       newRevId = revInfo[2];
       doc._rev_tree = [{
         pos: parseInt(revInfo[1], 10),
-        ids: [revInfo[2], []]
+        ids: [revInfo[2], opts, []]
       }];
     }
   }
@@ -114,7 +138,9 @@ var parseDoc = function(doc, newEdits) {
   if (typeof doc._id !== 'string') {
     error = Pouch.Errors.INVALID_ID;
   }
-
+  else if (!isValidId(doc._id)) {
+    error = Pouch.Errors.RESERVED_ID;
+  }
 
   doc._id = decodeURIComponent(doc._id);
   doc._rev = [nRevNum, newRevId].join('-');
@@ -150,101 +176,35 @@ var compareRevs = function(a, b) {
   return (a.rev_tree[0].start < b.rev_tree[0].start ? -1 : 1);
 };
 
-// Pretty much all below can be combined into a higher order function to
-// traverse revisions
-// Turn a tree into a list of rootToLeaf paths
-var expandTree = function(all, i, tree) {
-  all.push({rev: i + '-' + tree[0], status: 'available'});
-  tree[1].forEach(function(child) {
-    expandTree(all, i + 1, child);
+
+// for every node in a revision tree computes its distance from the closest
+// leaf
+var computeHeight = function(revs) {
+  var height = {};
+  var edges = [];
+  Pouch.merge.traverseRevTree(revs, function(isLeaf, pos, id, prnt) {
+    var rev = pos + "-" + id;
+    if (isLeaf) {
+      height[rev] = 0;
+    }
+    if (prnt !== undefined) {
+      edges.push({from: prnt, to: rev});
+    }
+    return rev;
   });
-}
 
-var collectRevs = function(path) {
-  var revs = [];
-  expandTree(revs, path.pos, path.ids);
-  return revs;
-}
-
-var collectLeavesInner = function(all, pos, tree) {
-  if (!tree[1].length) {
-    all.push({rev: pos + '-' + tree[0]});
-  }
-  tree[1].forEach(function(child) {
-    collectLeavesInner(all, pos+1, child);
-  });
-}
-
-var collectLeaves = function(revs) {
-  var leaves = [];
-  revs.forEach(function(tree) {
-    collectLeavesInner(leaves, tree.pos, tree.ids);
-  });
-  return leaves;
-}
-
-var collectConflicts = function(revs) {
-  var leaves = collectLeaves(revs);
-  // First is current rev
-  leaves.shift();
-  return leaves.map(function(x) { return x.rev; });
-}
-
-var fetchCheckpoint = function(src, target, callback) {
-  var id = Crypto.MD5(src.id() + target.id());
-  src.get('_local/' + id, function(err, doc) {
-    if (err && err.status === 404) {
-      callback(0);
+  edges.reverse();
+  edges.forEach(function(edge) {
+    if (height[edge.from] === undefined) {
+      height[edge.from] = 1 + height[edge.to];
     } else {
-      callback(doc.last_seq);
+      height[edge.from] = Math.min(height[edge.from], 1 + height[edge.to]);
     }
   });
+  return height;
 };
 
-var writeCheckpoint = function(src, target, checkpoint, callback) {
-  var check = {
-    _id: '_local/' + Crypto.MD5(src.id() + target.id()),
-    last_seq: checkpoint
-  };
-  src.get(check._id, function(err, doc) {
-    if (doc && doc._rev) {
-      check._rev = doc._rev;
-    }
-    src.put(check, function(err, doc) {
-      callback();
-    });
-  });
-};
-
-// Turn a tree into a list of rootToLeaf paths
-function expandTree2(all, current, pos, arr) {
-  current = current.slice(0);
-  current.push(arr[0]);
-  if (!arr[1].length) {
-    all.push({pos: pos, ids: current});
-  }
-  arr[1].forEach(function(child) {
-    expandTree2(all, current, pos, child);
-  });
-}
-
-// Trees are sorted by length, winning revision is the last revision
-// in the longest tree
-var winningRev = function(pos, tree) {
-  if (!tree[1].length) {
-    return pos + '-' + tree[0];
-  }
-  return winningRev(pos + 1, tree[1][0]);
-}
-
-var rootToLeaf = function(tree) {
-  var all = [];
-  tree.forEach(function(path) {
-    expandTree2(all, [], path.pos, path.ids);
-  });
-  return all;
-}
-
+// returns first element of arr satisfying callback predicate
 var arrayFirst = function(arr, callback) {
   for (var i = 0; i < arr.length; i++) {
     if (callback(arr[i], i) === true) {
@@ -256,142 +216,76 @@ var arrayFirst = function(arr, callback) {
 
 var filterChange = function(opts) {
   return function(change) {
-    if (opts.filter && !opts.filter.call(this, change.doc)) {
-      return;
+    var req = {};
+    req.query = opts.query_params;
+    if (opts.filter && !opts.filter.call(this, change.doc, req)) {
+      return false;
+    }
+    if (opts.doc_ids && opts.doc_ids.indexOf(change.id) !== -1) {
+      return false;
     }
     if (!opts.include_docs) {
       delete change.doc;
     }
-    call(opts.onChange, change);
-  }
-}
-
-var ajax = function ajax(options, callback) {
-  if (options.success && callback === undefined) {
-    callback = options.success;
-  }
-
-  var success = function sucess(obj, _, xhr) {
-    // Chrome will parse some attachments that are JSON. We don't want that.
-    if (options.dataType === false && typeof obj !== 'string') {
-      obj = JSON.stringify(obj);
-    }
-    call(callback, null, obj, xhr);
+    return true;
   };
-  var error = function error(err) {
-    if (err) {
-      var errObj = err.responseText
-        ? {status: err.status}
-        : err
-      try {
-        errObj = $.extend({}, errObj, JSON.parse(err.responseText));
-      } catch (e) {}
-      call(callback, errObj);
-    } else {
-      call(callback, true);
-    }
-  };
-
-  var defaults = {
-    success: success,
-    error: error,
-    headers: {
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-    },
-    dataType: 'json',
-    timeout: 10000
-  };
-  options = $.extend({}, defaults, options);
-
-  if (options.data && typeof options.data !== 'string') {
-    options.data = JSON.stringify(options.data);
-  }
-  if (options.auth) {
-    options.beforeSend = function(xhr) {
-      var token = btoa(options.auth.username + ":" + options.auth.password);
-      xhr.setRequestHeader("Authorization", "Basic " + token);
-    }
-  }
-
-  if ($.ajax) {
-    return $.ajax(options);
-  }
-  else {
-    // convert options from xhr api to request api
-    if (options.data) {
-      options.body = options.data;
-      delete options.data;
-    }
-    if (options.type) {
-      options.method = options.type;
-      delete options.type;
-    }
-
-    return request(options, function(err, response, body) {
-      if (err) {
-        err.status = response ? response.statusCode : 400;
-        return call(options.error, err);
-      }
-
-      var content_type = response.headers['content-type']
-        , data = (body || '');
-
-      // CouchDB doesn't always return the right content-type for JSON data, so
-      // we check for ^{ and }$ (ignoring leading/trailing whitespace)
-      if (options.dataType && (/json/.test(content_type)
-          || (/^[\s]*{/.test(data) && /}[\s]*$/.test(data)))) {
-        data = JSON.parse(data);
-      }
-
-      if (data.error) {
-        data.status = response.statusCode;
-        call(options.error, data);
-      }
-      else {
-        call(options.success, data, 'OK', response);
-      }
-    });
-  }
 };
 
-// Basic wrapper for localStorage
-var win = this;
-var localJSON = (function(){
-  if (!win.localStorage) {
-    return false;
-  }
-  return {
-    set: function(prop, val) {
-      localStorage.setItem(prop, JSON.stringify(val));
-    },
-    get: function(prop, def) {
-      try {
-        if (localStorage.getItem(prop) === null) {
-          return def;
-        }
-        return JSON.parse((localStorage.getItem(prop) || 'false'));
-      } catch(err) {
-        return def;
-      }
-    },
-    remove: function(prop) {
-      localStorage.removeItem(prop);
+var processChanges = function(opts, changes, last_seq) {
+  // TODO: we should try to filter and limit as soon as possible
+  changes = changes.filter(filterChange(opts));
+  if (opts.limit) {
+    if (opts.limit < changes.length) {
+      changes.length = opts.limit;
     }
-  };
-})();
+  }
+  changes.forEach(function(change){
+    call(opts.onChange, change);
+  });
+  call(opts.complete, null, {results: changes, last_seq: last_seq});
+};
 
-// btoa and atob don't exist in node. see https://developer.mozilla.org/en-US/docs/DOM/window.btoa
-if (typeof btoa === 'undefined') {
-  btoa = function(str) {
-    return new Buffer(unescape(encodeURIComponent(str)), 'binary').toString('base64');
+var rootToLeaf = function(tree) {
+  var paths = [];
+  Pouch.merge.traverseRevTree(tree, function(isLeaf, pos, id, history, opts) {
+    history = history ? history.slice(0) : [];
+    history.push({id: id, opts: opts});
+    if (isLeaf) {
+      var rootPos = pos + 1 - history.length;
+      paths.unshift({pos: rootPos, ids: history});
+    }
+    return history;
+  });
+  return paths;
+};
+
+// check if a specific revision of a doc has been deleted
+//  - metadata: the metadata object from the doc store
+//  - rev: (optional) the revision to check. defaults to winning revision
+var isDeleted = function(metadata, rev) {
+  if (!rev) {
+    rev = Pouch.merge.winningRev(metadata);
   }
-}
-if (typeof atob === 'undefined') {
-  atob = function(str) {
-    return decodeURIComponent(escape(new Buffer(str, 'base64').toString('binary')));
+  if (rev.indexOf('-') >= 0) {
+    rev = rev.split('-')[1];
   }
-}
+  var deleted = false;
+  Pouch.merge.traverseRevTree(metadata.rev_tree, function(isLeaf, pos, id, acc, opts) {
+    if (id === rev) {
+      deleted = !!opts.deleted;
+    }
+  });
+
+  return deleted;
+};
+
+var isChromeApp = function(){
+  return (typeof chrome !== "undefined" && typeof chrome.storage !== "undefined" && typeof chrome.storage.local !== "undefined");
+};
+
+var isCordova = function(){
+  return (typeof cordova !== "undefined" || typeof PhoneGap !== "undefined" || typeof phonegap !== "undefined");
+};
 
 if (typeof module !== 'undefined' && module.exports) {
   // use node.js's crypto library instead of the Crypto object created by deps/uuid.js
@@ -400,7 +294,10 @@ if (typeof module !== 'undefined' && module.exports) {
     MD5: function(str) {
       return crypto.createHash('md5').update(str).digest('hex');
     }
-  }
+  };
+  var extend = require('./deps/extend');
+  var ajax = require('./deps/ajax');
+
   request = require('request');
   _ = require('underscore');
   $ = _;
@@ -409,23 +306,103 @@ if (typeof module !== 'undefined' && module.exports) {
     Crypto: Crypto,
     call: call,
     yankError: yankError,
+    isLocalId: isLocalId,
     isAttachmentId: isAttachmentId,
     parseDocId: parseDocId,
     parseDoc: parseDoc,
+    isDeleted: isDeleted,
     compareRevs: compareRevs,
-    expandTree: expandTree,
-    collectRevs: collectRevs,
-    collectLeavesInner: collectLeavesInner,
-    collectLeaves: collectLeaves,
-    collectConflicts: collectConflicts,
-    fetchCheckpoint: fetchCheckpoint,
-    writeCheckpoint: writeCheckpoint,
-    winningRev: winningRev,
-    rootToLeaf: rootToLeaf,
+    computeHeight: computeHeight,
     arrayFirst: arrayFirst,
     filterChange: filterChange,
+    processChanges: processChanges,
+    atob: function(str) {
+      var base64 = new Buffer(str, 'base64');
+      // Node.js will just skip the characters it can't encode instead of
+      // throwing and exception
+      if (base64.toString('base64') !== str) {
+        throw("Cannot base64 encode full string");
+      }
+      return base64.toString('binary');
+    },
+    btoa: function(str) {
+      return new Buffer(str, 'binary').toString('base64');
+    },
+    extend: extend,
     ajax: ajax,
-    atob: atob,
-    btoa: btoa,
-  }
+    rootToLeaf: rootToLeaf,
+    isChromeApp: isChromeApp,
+    isCordova: isCordova
+  };
 }
+
+var Changes = function() {
+
+  var api = {};
+  var listeners = {};
+
+  if (isChromeApp()){
+    chrome.storage.onChanged.addListener(function(e){
+      api.notify(e.db_name.newValue);//object only has oldValue, newValue members
+    });
+  }
+  else {
+    window.addEventListener("storage", function(e) {
+      api.notify(e.key);
+    });
+  }
+
+  api.addListener = function(db_name, id, db, opts) {
+    if (!listeners[db_name]) {
+      listeners[db_name] = {};
+    }
+    listeners[db_name][id] = {
+      db: db,
+      opts: opts
+    };
+  };
+
+  api.removeListener = function(db_name, id) {
+    delete listeners[db_name][id];
+  };
+
+  api.clearListeners = function(db_name) {
+    delete listeners[db_name];
+  };
+
+  api.notifyLocalWindows = function(db_name){
+    //do a useless change on a storage thing
+    //in order to get other windows's listeners to activate
+    if (!isChromeApp()){
+      localStorage[db_name] = (localStorage[db_name] === "a") ? "b" : "a";
+    } else {
+      chrome.storage.local.set({db_name: db_name});
+    }
+  };
+
+  api.notify = function(db_name) {
+    if (!listeners[db_name]) { return; }
+
+    Object.keys(listeners[db_name]).forEach(function (i) {
+      var opts = listeners[db_name][i].opts;
+      listeners[db_name][i].db.changes({
+        include_docs: opts.include_docs,
+        conflicts: opts.conflicts,
+        continuous: false,
+        descending: false,
+        filter: opts.filter,
+        since: opts.since,
+        query_params: opts.query_params,
+        onChange: function(c) {
+          if (c.seq > opts.since && !opts.cancelled) {
+            opts.since = c.seq;
+            call(opts.onChange, c);
+          }
+        }
+      });
+    });
+  };
+
+  return api;
+};
+

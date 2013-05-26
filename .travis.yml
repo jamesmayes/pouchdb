@@ -1,12 +1,12 @@
-language: java
-
+language: node_js
+node_js:
+  - 0.8
 services:
   - couchdb
-
-install: "npm install"
-
-script: "./pouch test"
 
 branches:
   only:
     - master
+
+before_script:
+  - npm install -g grunt-cli
